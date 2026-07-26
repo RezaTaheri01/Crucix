@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 
-// Crucix Master Orchestrator — runs all intelligence sources in parallel
-// Outputs structured JSON for Claude to synthesize into actionable briefing
+// Crucix Master Orchestrator — runs intelligence sources with controlled concurrency
+// Outputs structured JSON for LLM synthesis
 
-import './utils/env.mjs'; // Load API keys from .env
+import './utils/env.mjs';
 import { pathToFileURL } from 'node:url';
 
 // === Tier 1: Core OSINT & Geopolitical ===
@@ -37,115 +37,326 @@ import { briefing as reddit } from './sources/reddit.mjs';
 import { briefing as telegram } from './sources/telegram.mjs';
 import { briefing as kiwisdr } from './sources/kiwisdr.mjs';
 
-// === Tier 4: Space & Satellites ===
+// === Tier 4: Space ===
 import { briefing as space } from './sources/space.mjs';
 
-// === Tier 5: Live Market Data ===
+// === Tier 5: Market ===
 import { briefing as yfinance } from './sources/yfinance.mjs';
 
-// === Tier 6: Cyber & Infrastructure ===
+// === Tier 6: Cyber ===
 import { briefing as cisaKev } from './sources/cisa-kev.mjs';
 import { briefing as cloudflareRadar } from './sources/cloudflare-radar.mjs';
 
-const SOURCE_TIMEOUT_MS = 30_000; // 30s max per individual source
 
+const SOURCE_TIMEOUT_MS = 30_000;
+const MAX_CONCURRENT_SOURCES = 4;
+
+
+/**
+ * Runs a single source safely with timeout
+ */
 export async function runSource(name, fn, ...args) {
-  const start = Date.now();
-  let timer;
-  try {
-    const dataPromise = fn(...args);
-    const timeoutPromise = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`Source ${name} timed out after ${SOURCE_TIMEOUT_MS / 1000}s`)), SOURCE_TIMEOUT_MS);
-    });
-    const data = await Promise.race([dataPromise, timeoutPromise]);
-    return { name, status: 'ok', durationMs: Date.now() - start, data };
-  } catch (e) {
-    return { name, status: 'error', durationMs: Date.now() - start, error: e.message };
-  } finally {
-    clearTimeout(timer);
-  }
+
+    const start = Date.now();
+
+    let timer;
+
+    try {
+
+        const dataPromise = fn(...args);
+
+        const timeoutPromise = new Promise((_, reject) => {
+
+            timer = setTimeout(() => {
+
+                reject(
+                    new Error(
+                        `Source ${name} timed out after ${SOURCE_TIMEOUT_MS / 1000}s`
+                    )
+                );
+
+            }, SOURCE_TIMEOUT_MS);
+
+        });
+
+
+        const data = await Promise.race([
+            dataPromise,
+            timeoutPromise
+        ]);
+
+
+        return {
+            name,
+            status: 'ok',
+            durationMs: Date.now() - start,
+            data
+        };
+
+
+    } catch (e) {
+
+        return {
+            name,
+            status: 'error',
+            durationMs: Date.now() - start,
+            error: e.message
+        };
+
+
+    } finally {
+
+        clearTimeout(timer);
+
+    }
 }
 
+
+/**
+ * Execute promises with limited concurrency
+ * Prevents Render 512MB RAM crashes
+ */
+async function runWithConcurrency(tasks, limit = MAX_CONCURRENT_SOURCES) {
+
+    const results = new Array(tasks.length);
+
+    let index = 0;
+
+
+    async function worker() {
+
+        while (index < tasks.length) {
+
+            const current = index++;
+
+            try {
+
+                results[current] = await tasks[current];
+
+            } catch (error) {
+
+                results[current] = {
+                    status: 'rejected',
+                    error: error.message
+                };
+
+            }
+
+        }
+
+    }
+
+
+    const workers = Array.from(
+        {
+            length: Math.min(limit, tasks.length)
+        },
+        () => worker()
+    );
+
+
+    await Promise.all(workers);
+
+
+    return results;
+}
+
+
+
+/**
+ * Full intelligence sweep
+ */
 export async function fullBriefing() {
-  console.error('[Crucix] Starting intelligence sweep — 29 sources...');
-  const start = Date.now();
 
-  const allPromises = [
-    // Tier 1: Core OSINT & Geopolitical
-    runSource('GDELT', gdelt),
-    runSource('OpenSky', opensky),
-    runSource('FIRMS', firms),
-    runSource('Maritime', ships),
-    runSource('Safecast', safecast),
-    runSource('ACLED', acled),
-    runSource('ReliefWeb', reliefweb),
-    runSource('WHO', who),
-    runSource('OFAC', ofac),
-    runSource('OpenSanctions', opensanctions),
-    runSource('ADS-B', adsb),
+    console.error(
+        '[Crucix] Starting intelligence sweep — 29 sources...'
+    );
 
-    // Tier 2: Economic & Financial
-    runSource('FRED', fred, process.env.FRED_API_KEY),
-    runSource('Treasury', treasury),
-    runSource('BLS', bls, process.env.BLS_API_KEY),
-    runSource('EIA', eia, process.env.EIA_API_KEY),
-    runSource('GSCPI', gscpi),
-    runSource('USAspending', usaspending),
-    runSource('Comtrade', comtrade),
 
-    // Tier 3: Weather, Environment, Technology, Social
-    runSource('NOAA', noaa),
-    runSource('EPA', epa),
-    runSource('Patents', patents),
-    runSource('Bluesky', bluesky),
-    runSource('Reddit', reddit),
-    runSource('Telegram', telegram),
-    runSource('KiwiSDR', kiwisdr),
+    const start = Date.now();
 
-    // Tier 4: Space & Satellites
-    runSource('Space', space),
 
-    // Tier 5: Live Market Data
-    runSource('YFinance', yfinance),
 
-    // Tier 6: Cyber & Infrastructure
-    runSource('CISA-KEV', cisaKev),
-    runSource('Cloudflare-Radar', cloudflareRadar),
-  ];
+    const tasks = [
 
-  // Each runSource has its own 30s timeout, so allSettled will resolve
-  // within ~30s even if APIs hang. Global timeout is a safety net.
-  const results = await Promise.allSettled(allPromises);
+        // Tier 1
+        runSource('GDELT', gdelt),
+        runSource('OpenSky', opensky),
+        runSource('FIRMS', firms),
+        runSource('Maritime', ships),
+        runSource('Safecast', safecast),
+        runSource('ACLED', acled),
+        runSource('ReliefWeb', reliefweb),
+        runSource('WHO', who),
+        runSource('OFAC', ofac),
+        runSource('OpenSanctions', opensanctions),
+        runSource('ADS-B', adsb),
 
-  const sources = results.map(r => r.status === 'fulfilled' ? r.value : { status: 'failed', error: r.reason?.message });
-  const totalMs = Date.now() - start;
 
-  const output = {
-    crucix: {
-      version: '2.0.0',
-      timestamp: new Date().toISOString(),
-      totalDurationMs: totalMs,
-      sourcesQueried: sources.length,
-      sourcesOk: sources.filter(s => s.status === 'ok').length,
-      sourcesFailed: sources.filter(s => s.status !== 'ok').length,
-    },
-    sources: Object.fromEntries(
-      sources.filter(s => s.status === 'ok').map(s => [s.name, s.data])
-    ),
-    errors: sources.filter(s => s.status !== 'ok').map(s => ({ name: s.name, error: s.error })),
-    timing: Object.fromEntries(
-      sources.map(s => [s.name, { status: s.status, ms: s.durationMs }])
-    ),
-  };
+        // Tier 2
+        runSource('FRED', fred, process.env.FRED_API_KEY),
+        runSource('Treasury', treasury),
+        runSource('BLS', bls, process.env.BLS_API_KEY),
+        runSource('EIA', eia, process.env.EIA_API_KEY),
+        runSource('GSCPI', gscpi),
+        runSource('USAspending', usaspending),
+        runSource('Comtrade', comtrade),
 
-  console.error(`[Crucix] Sweep complete in ${totalMs}ms — ${output.crucix.sourcesOk}/${sources.length} sources returned data`);
-  return output;
+
+        // Tier 3
+        runSource('NOAA', noaa),
+        runSource('EPA', epa),
+        runSource('Patents', patents),
+        runSource('Bluesky', bluesky),
+        runSource('Reddit', reddit),
+        runSource('Telegram', telegram),
+        runSource('KiwiSDR', kiwisdr),
+
+
+        // Tier 4
+        runSource('Space', space),
+
+
+        // Tier 5
+        runSource('YFinance', yfinance),
+
+
+        // Tier 6
+        runSource('CISA-KEV', cisaKev),
+        runSource('Cloudflare-Radar', cloudflareRadar)
+
+    ];
+
+
+
+    console.error(
+        `[Crucix] Running ${tasks.length} sources with concurrency ${MAX_CONCURRENT_SOURCES}`
+    );
+
+
+
+    const results = await runWithConcurrency(tasks);
+
+
+
+    const sources = results.map(
+        r => r?.status
+            ? r
+            : {
+                status: 'error',
+                error: 'Unknown failure'
+            }
+    );
+
+
+
+    const totalMs = Date.now() - start;
+
+
+
+    const output = {
+
+        crucix: {
+
+            version: '2.0.0',
+
+            timestamp: new Date().toISOString(),
+
+            totalDurationMs: totalMs,
+
+            sourcesQueried: sources.length,
+
+            sourcesOk:
+                sources.filter(
+                    s => s.status === 'ok'
+                ).length,
+
+            sourcesFailed:
+                sources.filter(
+                    s => s.status !== 'ok'
+                ).length
+
+        },
+
+
+        sources:
+            Object.fromEntries(
+
+                sources
+                    .filter(
+                        s => s.status === 'ok'
+                    )
+                    .map(
+                        s => [
+                            s.name,
+                            s.data
+                        ]
+                    )
+
+            ),
+
+
+        errors:
+            sources
+                .filter(
+                    s => s.status !== 'ok'
+                )
+                .map(
+                    s => ({
+                        name: s.name,
+                        error: s.error
+                    })
+                ),
+
+
+        timing:
+            Object.fromEntries(
+
+                sources.map(
+                    s => [
+                        s.name,
+                        {
+                            status: s.status,
+                            ms: s.durationMs
+                        }
+                    ]
+                )
+
+            )
+
+    };
+
+
+
+    console.error(
+
+        `[Crucix] Sweep complete in ${totalMs}ms — ${output.crucix.sourcesOk}/${sources.length} sources returned data`
+
+    );
+
+
+    return output;
+
 }
 
-// Run and output when executed directly
-const entryHref = process.argv[1] ? pathToFileURL(process.argv[1]).href : null;
+
+
+// Run standalone
+const entryHref = process.argv[1]
+    ? pathToFileURL(process.argv[1]).href
+    : null;
+
 
 if (entryHref && import.meta.url === entryHref) {
-  const data = await fullBriefing();
-  console.log(JSON.stringify(data, null, 2));
+
+    const data = await fullBriefing();
+
+    console.log(
+        JSON.stringify(
+            data,
+            null,
+            2
+        )
+    );
+
 }
